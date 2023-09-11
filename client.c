@@ -59,6 +59,18 @@ enum {
 
 #define TICK_TIME               (1000.0 / (double)TICK_RATE)
 
+// button bit-masks
+typedef enum {
+    BUTTON_A                    = 1,
+    BUTTON_B                    = 2,
+    BUTTON_X                    = 4,
+    BUTTON_Y                    = 8,
+    BUTTON_UP                   = 16,
+    BUTTON_DOWN                 = 32,
+    BUTTON_LEFT                 = 64,
+    BUTTON_RIGHT                = 128,
+} button_t;
+
 
 /*==[[ Types ]]===============================================================*/
 
@@ -83,6 +95,11 @@ static struct state_t {
     int                         argc; // command line argument count
     char                        **argv; // command line argument vector
     uint32_t                    tick; // current game tick
+
+    // input system
+    struct {
+        uint8_t                 down; // bit-mask of pressed buttons
+    } input;
 
     // video system
     struct {
@@ -151,6 +168,16 @@ static void draw_tile(const int x, const int y, const uint8_t tile) {
 static void draw_text(const int x, const int y, const char *text) {
     for (int xx = x; *text; ++text, ++xx)
         draw_tile(xx, y, (uint8_t)*text);
+}
+
+// toggle fullscreen
+static void toggle_fullscreen(void) {
+    uint32_t flags = SDL_GetWindowFlags(state.video.window);
+    if (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) {
+        SDL_SetWindowFullscreen(state.video.window, 0);
+    } else {
+        SDL_SetWindowFullscreen(state.video.window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+    }
 }
 
 // take a screenshot (this is for documentation only)
@@ -344,12 +371,73 @@ static void render_audio(void *userdata, Uint8 *stream8, int len8) {
 
 /*==[[ Input Handling ]]======================================================*/
 
+// apply a button state
+static void apply_button(const button_t button, const bool down) {
+    if (down) {
+        state.input.down |=  button;
+    } else {
+        state.input.down &= ~button;
+    }
+}
+
+// apply mouse buttons
+static void apply_mouse(const int button, const bool down) {
+    switch (button) {
+        case SDL_BUTTON_LEFT: apply_button(BUTTON_A, down); break;
+        case SDL_BUTTON_RIGHT: apply_button(BUTTON_B, down); break;
+    }
+}
+
+// apply keyboard buttons
+static void apply_keyboard(const SDL_KeyCode key, const bool down) {
+    switch (key) {
+        // DPAD
+        case SDLK_w: case SDLK_UP: case SDLK_8: case SDLK_KP_8: apply_button(BUTTON_UP, down); break;
+        case SDLK_s: case SDLK_DOWN: case SDLK_2: case SDLK_KP_2: apply_button(BUTTON_DOWN, down); break;
+        case SDLK_a: case SDLK_LEFT: case SDLK_4: case SDLK_KP_4: apply_button(BUTTON_LEFT, down); break;
+        case SDLK_d: case SDLK_RIGHT: case SDLK_6: case SDLK_KP_6: apply_button(BUTTON_RIGHT, down); break;
+        // action keys
+        case SDLK_i: case SDLK_RETURN: case SDLK_RETURN2: apply_button(BUTTON_A, down); break;
+        case SDLK_o: case SDLK_SPACE: apply_button(BUTTON_B, down); break;
+        case SDLK_k: apply_button(BUTTON_X, down); break;
+        case SDLK_l: apply_button(BUTTON_Y, down); break;
+        // special key handling
+        case SDLK_ESCAPE: if (down) state.running = false; break;
+        case SDLK_F1: if (down) adjust_gain(-0.1f); break;
+        case SDLK_F2: if (down) adjust_gain( 0.1f); break;
+        case SDLK_F9: if (down) load_assets(); break;
+        case SDLK_F12: if (down) toggle_fullscreen(); break;
+        default: break;
+    }
+}
+
+// apply gamepad buttons
+static void apply_gamepad(const int button, const bool down) {
+    switch (button) {
+        case SDL_CONTROLLER_BUTTON_A: apply_button(BUTTON_A, down); break;
+        case SDL_CONTROLLER_BUTTON_B: apply_button(BUTTON_B, down); break;
+        case SDL_CONTROLLER_BUTTON_X: apply_button(BUTTON_X, down); break;
+        case SDL_CONTROLLER_BUTTON_Y: apply_button(BUTTON_Y, down); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_UP: apply_button(BUTTON_UP, down); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN: apply_button(BUTTON_DOWN, down); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_LEFT: apply_button(BUTTON_LEFT, down); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: apply_button(BUTTON_RIGHT, down); break;
+    }
+}
+
 // handle SDL events
 static void handle_SDL_events(void) {
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         switch (ev.type) {
             case SDL_QUIT: state.running = false; break;
+            case SDL_MOUSEBUTTONDOWN: apply_mouse(ev.button.button, true); break;
+            case SDL_MOUSEBUTTONUP: apply_mouse(ev.button.button, false); break;
+            case SDL_KEYDOWN: apply_keyboard(ev.key.keysym.sym, true); break;
+            case SDL_KEYUP: apply_keyboard(ev.key.keysym.sym, false); break;
+            case SDL_CONTROLLERBUTTONDOWN: apply_gamepad(ev.cbutton.button, true); break;
+            case SDL_CONTROLLERBUTTONUP: apply_gamepad(ev.cbutton.button, false); break;
+            case SDL_CONTROLLERDEVICEADDED: SDL_GameControllerOpen(ev.cdevice.which); break;
         }
     }
 }
@@ -363,7 +451,9 @@ static void run_tick(void) {
     clear_screen();
     draw_text(0, 0, "Hello World!");
     draw_text(0, 1, format_string("tick: %d", state.tick));
-    if (state.tick % 20 == 0) play_sound(0);
+    draw_text(0, 2, format_string("down: %d", state.input.down));
+    if (state.input.down & BUTTON_A) play_sound(0);
+    if (state.input.down & BUTTON_X) debug_screenshot();
 }
 
 // run the client main loop
