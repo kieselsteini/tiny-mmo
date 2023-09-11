@@ -47,6 +47,11 @@ enum {
     VIDEO_COLS                  = 16, // tile columns
     VIDEO_ROWS                  = 16, // tile rows
     TILE_SIZE                   = 8, // tile size (8x8 pixels)
+
+    AUDIO_RATE                  = 8000, // we mix audio at 8KHz
+    AUDIO_VOICES                = 8, // we support 8 concurrent sounds
+    AUDIO_SOUNDS                = 32, // we have 32 sound effects
+    AUDIO_TRACKS                = 8, // we have 8 music tracks
 };
 
 #define VIDEO_TITLE             "tinyMMO - Client"
@@ -55,7 +60,23 @@ enum {
 #define TICK_TIME               (1000.0 / (double)TICK_RATE)
 
 
-/*==[[ Global State ]]=========================================================*/
+/*==[[ Types ]]===============================================================*/
+
+// sound effect / music asset
+typedef struct sound_t {
+    int16_t                     *data; // 16-bit PCM data
+    int                         length; // length in PCM samples
+} sound_t;
+
+// sound / music playback channel
+typedef struct voice_t {
+    sound_t                     *sound; // which sound is currently played
+    int                         position; // current playback position
+    bool                        loop; // shall we loop?
+} voice_t;
+
+
+/*==[[ Global State ]]========================================================*/
 
 static struct state_t {
     bool                        running; // keep the client running
@@ -63,12 +84,23 @@ static struct state_t {
     char                        **argv; // command line argument vector
     uint32_t                    tick; // current game tick
 
+    // video system
     struct {
         SDL_Window              *window; // SDL2 window handle
         SDL_Renderer            *renderer; // SDL2 renderer handle
         SDL_Texture             *texture; // SDL2 texture handle
         uint8_t                 screen[VIDEO_ROWS][VIDEO_COLS]; // tilemap
     } video;
+
+    // audio system
+    struct {
+        SDL_AudioDeviceID       device; // SDL2 audio device handle
+        float                   gain; // global audio volume
+        voice_t                 voices[AUDIO_VOICES]; // our audio voices
+        sound_t                 sounds[AUDIO_SOUNDS]; // our sound effects
+        sound_t                 music; // current music track
+        int                     music_id;
+    } audio;
 } state;
 
 
@@ -90,6 +122,19 @@ static const char *format_string(const char *fmt, ...) {
     va_start(va, fmt); SDL_vsnprintf(text, sizeof(text), fmt, va); va_end(va);
     return text;
 }
+
+// clamp integer value
+static int clampi(const int x, const int min, const int max) {
+    if (x < min) return min; else if (x > max) return max; else return x;
+}
+
+// clamp float value
+static float clampf(const float x, const float min, const float max) {
+    if (x < min) return min; else if (x > max) return max; else return x;
+}
+
+
+/*==[[ Video Functions ]]=====================================================*/
 
 // clear the screen
 static void clear_screen(void) {
@@ -121,6 +166,66 @@ void debug_screenshot(void) {
     SDL_FreeSurface(surface);
 }
 
+/*==[[ Audio Functions ]]=====================================================*/
+
+// stop all audio output
+static void stop_audio(void) {
+    SDL_LockAudioDevice(state.audio.device);
+    for (int i = 0; i < AUDIO_VOICES; ++i)
+        state.audio.voices[i] = (voice_t){0};
+    SDL_UnlockAudioDevice(state.audio.device);
+}
+
+// adjust global audio volume
+static void adjust_gain(const float delta) {
+    SDL_LockAudioDevice(state.audio.device);
+    state.audio.gain = clampf(state.audio.gain + delta, 0.0f, 1.0f);
+    SDL_UnlockAudioDevice(state.audio.device);
+}
+
+// forward declaration of sound loading
+static void load_sound(sound_t *sound, const char *filename);
+
+// play music
+static void play_music(const int n) {
+    // make sure we skip everything when we are currently playing the same music
+    if (n == state.audio.music_id)
+        return;
+    state.audio.music_id = n;
+    // stop music playback on voice 0
+    SDL_LockAudioDevice(state.audio.device);
+    state.audio.voices[0] = (voice_t){0};
+    SDL_UnlockAudioDevice(state.audio.device);
+    // free previous loaded audio track
+    if (state.audio.music.data != NULL) {
+        SDL_FreeWAV((Uint8*)state.audio.music.data);
+        state.audio.music = (sound_t){0};
+    }
+    // load music track (if possible)
+    load_sound(&state.audio.music, format_string("assets/music%02d.wav", n));
+    if (state.audio.music.data != NULL) {
+        SDL_LockAudioDevice(state.audio.device);
+        state.audio.voices[0] = (voice_t){ .sound = &state.audio.music, .loop = true };
+        SDL_UnlockAudioDevice(state.audio.device);
+    }
+}
+
+// play sound effect
+static void play_sound(const int n) {
+    // make sure the sound effect exists
+    if ((n < 0) || (n >= AUDIO_SOUNDS) || (state.audio.sounds[n].data == NULL))
+        return;
+    // find free audio voice to play this effect
+    SDL_LockAudioDevice(state.audio.device);
+    for (int i = 1; i < AUDIO_VOICES; ++i) {
+        if (state.audio.voices[i].sound == NULL) {
+            state.audio.voices[i] = (voice_t){ .sound = &state.audio.sounds[n] };
+            break;
+        }
+    }
+    SDL_UnlockAudioDevice(state.audio.device);
+}
+
 
 /*==[[ Asset Handling ]]======================================================*/
 
@@ -140,11 +245,39 @@ static SDL_Texture *load_tileset(const char *filename) {
     return texture;
 }
 
+// load sound effect / music track
+static void load_sound(sound_t *sound, const char *filename) {
+    SDL_AudioSpec spec;
+    Uint8 *sample_data;
+    Uint32 sample_length;
+    if (SDL_LoadWAV(filename, &spec, &sample_data, &sample_length) == NULL)
+        return;
+    if ((spec.format != AUDIO_S16SYS) || (spec.channels != 1) || (spec.freq != AUDIO_RATE)) {
+        SDL_FreeWAV(sample_data);
+        panic("Sound (%s) is not 16-bit PCM mono 8KHz");
+    }
+    *sound = (sound_t){ .data = (int16_t*)sample_data, .length = sample_length / 2 };
+}
+
 // free all assets
 static void free_assets(void) {
+    stop_audio();
+    // free tileset
     if (state.video.texture != NULL) {
         SDL_DestroyTexture(state.video.texture);
         state.video.texture = NULL;
+    }
+    // free sounds
+    for (int i = 0; i < AUDIO_SOUNDS; ++i) {
+        if (state.audio.sounds[i].data != NULL) {
+            SDL_FreeWAV((Uint8*)state.audio.sounds[i].data);
+            state.audio.sounds[i] = (sound_t){0};
+        }
+    }
+    // free music
+    if (state.audio.music.data != NULL) {
+        SDL_FreeWAV((Uint8*)state.audio.music.data);
+        state.audio.music = (sound_t){0};
     }
 }
 
@@ -152,6 +285,8 @@ static void free_assets(void) {
 static void load_assets(void) {
     free_assets();
     state.video.texture = load_tileset("assets/tiles.bmp");
+    for (int i = 0; i < AUDIO_SOUNDS; ++i)
+        load_sound(&state.audio.sounds[i], format_string("assets/sound%02d.wav", i));
 }
 
 
@@ -176,6 +311,37 @@ static void render_video(void) {
 }
 
 
+/*==[[ Audio Rendering ]]=====================================================*/
+
+// render a single audio voice
+static int render_voice(voice_t *voice) {
+    if (voice->sound == NULL)
+        return 0;
+    if (voice->position >= voice->sound->length) {
+        if (voice->loop) {
+            voice->position = 0;
+        } else {
+            voice->sound = NULL;
+            return 0;
+        }
+    }
+    return voice->sound->data[voice->position++];
+}
+
+// render all audio voices from SDL callback
+static void render_audio(void *userdata, Uint8 *stream8, int len8) {
+    (void)userdata;
+    int16_t *stream = (int16_t*)stream8;
+    const int len = len8 / 2;
+    for (int i = 0; i < len; ++i) {
+        int total = 0;
+        for (int j = 0; j < AUDIO_VOICES; ++j)
+            total += render_voice(&state.audio.voices[j]);
+        *stream++ = (int16_t)clampi(total * state.audio.gain, -32768, 32767);
+    }
+}
+
+
 /*==[[ Input Handling ]]======================================================*/
 
 // handle SDL events
@@ -197,6 +363,7 @@ static void run_tick(void) {
     clear_screen();
     draw_text(0, 0, "Hello World!");
     draw_text(0, 1, format_string("tick: %d", state.tick));
+    if (state.tick % 20 == 0) play_sound(0);
 }
 
 // run the client main loop
@@ -220,6 +387,8 @@ static void run_client(void) {
 // shutdown the client
 static void quit_client(void) {
     free_assets();
+    if (state.audio.device != 0)
+        SDL_CloseAudioDevice(state.audio.device);
     if (state.video.renderer != NULL)
         SDL_DestroyRenderer(state.video.renderer);
     if (state.video.window != NULL)
@@ -230,7 +399,7 @@ static void quit_client(void) {
 // initialize the client
 static void init_client(int argc, char **argv) {
     // init state and SDL2 library
-    state = (struct state_t){ .running = true, .argc = argc, .argv = argv };
+    state = (struct state_t){ .running = true, .argc = argc, .argv = argv, .audio.gain = 1.0f, .audio.music_id = -1 };
     atexit(quit_client);
     if (SDL_Init(SDL_INIT_EVERYTHING))
         panic("SDL_Init() failed: %s", SDL_GetError());
@@ -249,12 +418,19 @@ static void init_client(int argc, char **argv) {
         panic("SDL_CreateRenderer() failed: %s", SDL_GetError());
     if (SDL_RenderSetLogicalSize(state.video.renderer, VIDEO_COLS * TILE_SIZE, VIDEO_ROWS * TILE_SIZE))
         panic("SDL_RenderSetLogicalSize() failed: %s", SDL_GetError());
+    // init audio system
+    const SDL_AudioSpec want = { .format = AUDIO_S16SYS, .freq = AUDIO_RATE, .channels = 1, .samples = 1024, .callback = render_audio };
+    SDL_AudioSpec have;
+    if ((state.audio.device = SDL_OpenAudioDevice(NULL, SDL_FALSE, &want, &have, 0)) == 0)
+        panic("SDL_OpenAudioDevice() failed: %s", SDL_GetError());
+    SDL_PauseAudioDevice(state.audio.device, SDL_FALSE);
 }
 
 // main entry point
 int main(int argc, char **argv) {
     init_client(argc, argv);
     load_assets();
+    play_music(0);
     run_client();
     return 0;
 }
